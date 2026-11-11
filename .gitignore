@@ -1,0 +1,29 @@
+# Secrets: never commit these
+.streamlit/secrets.toml
+secrets.toml
+.env
+.env.*
+*.pem
+*.key
+
+# Old local JSON data from the pre-Supabase version (may contain member details)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
