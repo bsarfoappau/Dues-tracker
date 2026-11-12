@@ -9,13 +9,14 @@ Dues Tracker (Supabase edition)
 """
 import io
 import re
-import csv
 import copy
 import json
 import html
 import time
 import hashlib
 import inspect
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date, timezone, timedelta
 
 import altair as alt
@@ -191,6 +192,25 @@ div[data-testid="stPopoverBody"] input, div[data-testid="stPopoverBody"] textare
 .stApp [data-baseweb="input"], .stApp [data-baseweb="base-input"],
 .stApp [data-baseweb="textarea"], .stApp [data-baseweb="select"] > div { border-radius: 14px !important; }
 div[data-testid="stPopoverBody"] { max-width: min(94vw, 440px) !important; }
+
+/* Readable on phones in dark mode too: tabs, inputs, forms, expanders */
+.stApp [data-baseweb="tab-list"] { gap: .4rem; }
+.stApp [data-baseweb="tab-list"] button p { color: #5B5E80 !important; font-weight: 700; font-size: 1rem; }
+.stApp [data-baseweb="tab-list"] button[aria-selected="true"] p { color: __COBALT__ !important; }
+.stApp [data-baseweb="tab-highlight"] { background-color: __COBALT__ !important; }
+.stApp [data-baseweb="tab-border"] { background-color: #E4E6F4 !important; }
+.stApp [data-baseweb="input"], .stApp [data-baseweb="base-input"],
+.stApp [data-baseweb="textarea"], .stApp [data-baseweb="select"] > div {
+    background: #F3F4FA !important; border: 1px solid #D5D8EE !important;
+}
+.stApp input, .stApp textarea { color: #17153B !important; -webkit-text-fill-color: #17153B !important; background: transparent !important; }
+.stApp input::placeholder, .stApp textarea::placeholder { color: #7C7FA3 !important; opacity: 1 !important; -webkit-text-fill-color: #7C7FA3 !important; }
+.stApp [data-testid="stWidgetLabel"] p, .stApp label p { color: #17153B !important; }
+.stApp [data-testid="stForm"] { border: 1px solid #E4E6F4 !important; border-radius: 18px; background: #fff; }
+.stApp [data-testid="stExpander"] details { background: #fff; border: 2px solid #E4E6F4 !important; border-radius: 14px; }
+.stApp [data-testid="stExpander"] summary p, .stApp [data-testid="stExpander"] summary span,
+.stApp [data-testid="stExpander"] summary svg { color: #17153B !important; fill: #17153B !important; }
+.stApp [class*="st-key-hrow_report"] button { padding: .45rem .5rem !important; }
 
 /* Cards */
 .stApp [class*="st-key-card_"], .stApp [class*="st-key-mcard_"] {
@@ -567,23 +587,30 @@ def refresh_auth() -> bool:
         return False
 
 
+def run_failed(e: Exception):
+    msg = str(e)
+    if "jwt" in msg.lower() and "expired" in msg.lower():
+        reset_session("Your session expired. Please sign in again.")
+        st.rerun()
+    st.error(f"Database error: {msg}")
+    st.stop()
+
+
 def run(query):
     """Execute a Supabase query. Shows a clear message instead of a stack trace on failure."""
     try:
         return query.execute()
     except Exception as e:
-        msg = str(e)
-        if "jwt" in msg.lower() and "expired" in msg.lower():
-            reset_session("Your session expired. Please sign in again.")
-            st.rerun()
-        st.error(f"Database error: {msg}")
-        st.stop()
+        run_failed(e)
 
 
 # ─────────────────────────────────────────────────────────────
 # Per-run cache. The script reruns after every click, and many helpers need the same
 # tables, so each table is fetched at most once per run. Writes drop the cache entry.
 # ─────────────────────────────────────────────────────────────
+CACHE_TTL = 60   # seconds. Writes drop the entry at once; this only bounds staleness from other devices.
+
+
 def _store() -> dict:
     return st.session_state.setdefault("_db", {})
 
@@ -595,24 +622,65 @@ def touch(*names):
 
 
 def cached(name: str, loader):
+    """Return a table from the session cache, loading it when missing or older than CACHE_TTL.
+    The returned lists are shared, so treat them as read-only."""
     store = _store()
-    if name not in store:
-        store[name] = loader()
-    return copy.deepcopy(store[name])
+    hit = store.get(name)
+    if hit is None or time.time() - hit[0] > CACHE_TTL:
+        hit = (time.time(), loader())
+        store[name] = hit
+    return hit[1]
 
 
 PAGE = 1000   # PostgREST returns at most 1000 rows per request, so page through
 
 
-def fetch_all(table: str, order: str = "id") -> list:
+def _fetch_table(client, user_id: str, table: str, order: str = "id") -> list:
     rows, start = [], 0
     while True:
-        res = run(sb().table(table).select("*").eq("user_id", uid()).order(order).range(start, start + PAGE - 1))
+        res = (client.table(table).select("*").eq("user_id", user_id).order(order)
+               .range(start, start + PAGE - 1).execute())
         batch = res.data or []
         rows += batch
         if len(batch) < PAGE:
             return rows
         start += PAGE
+
+
+def _fetch_profile(client, user_id: str):
+    res = client.table("profiles").select("*").eq("id", user_id).limit(1).execute()
+    return (res.data or [None])[0]
+
+
+def fetch_all(table: str, order: str = "id") -> list:
+    try:
+        return _fetch_table(sb(), uid(), table, order)
+    except Exception as e:
+        run_failed(e)
+
+
+def prefetch():
+    """Load the profile, members, contributions and payments at the same time instead of one after
+    another. On a slow connection this turns four round trips into roughly one."""
+    store, now = _store(), time.time()
+    jobs = {
+        "profile": lambda c, u: _fetch_profile(c, u),
+        "members": lambda c, u: _fetch_table(c, u, "members"),
+        "contribs": lambda c, u: _fetch_table(c, u, "contributions"),
+        "payments": lambda c, u: _fetch_table(c, u, "payments"),
+    }
+    need = [n for n in jobs if n not in store or now - store[n][0] > CACHE_TTL]
+    if len(need) < 2:
+        return
+    client, user_id = sb(), uid()
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {n: pool.submit(jobs[n], client, user_id) for n in need}
+            results = {n: f.result() for n, f in futures.items()}
+        for n, value in results.items():
+            store[n] = (time.time(), value)
+    except Exception:
+        pass   # fall back to loading each table when it is first needed
 
 
 # ─────────────────────────────────────────────────────────────
@@ -675,7 +743,7 @@ def reset_session(notice: str = ""):
 
 
 def do_logout():
-    log_activity("Signed out")
+    log_activity("Signed out", wait=True)
     client = st.session_state.get("sb")
     if client is not None:
         try:
@@ -861,10 +929,21 @@ def load_activity():
     return cached("activity", _load)
 
 
-def log_activity(action: str, details: str = ""):
-    run(sb().table("activity").insert({"user_id": uid(), "actor": st.session_state.get("user", ""),
-                                       "action": action, "details": details}))
+def _insert_activity(client, row: dict):
+    try:
+        client.table("activity").insert(row).execute()
+    except Exception:
+        pass   # the audit trail must never block or break the action the user just did
+
+
+def log_activity(action: str, details: str = "", wait: bool = False):
+    """Record an action. It is sent in the background so the screen does not wait for it."""
+    row = {"user_id": uid(), "actor": st.session_state.get("user", ""), "action": action, "details": details}
     touch("activity")
+    if wait:
+        _insert_activity(sb(), row)
+    else:
+        threading.Thread(target=_insert_activity, args=(sb(), row), daemon=True).start()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1183,7 +1262,7 @@ def contrib_stats(c: dict, members: list, period: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
-# Reports (Excel, Word and CSV) with member / month / contribution filters
+# Reports (Excel and Word) with member / month / contribution filters
 # Every export starts with the Group Name.
 # Monthly contributions follow the month filter (or every month with records).
 # One-off contributions are not tied to a month, so they always show everything recorded.
@@ -1267,7 +1346,7 @@ def build_report(member_id=None, month=None, contrib_id=None) -> dict:
         })
 
         # Month-by-month grid for a monthly contribution when every month is included
-        if monthly and not month and periods and people:
+        if monthly and not month and len(periods) > 1 and people:
             cols = ["Name"] + [month_short(x) for x in periods] + ["Total"]
             rows = []
             for m in people:
@@ -1314,11 +1393,14 @@ def build_report(member_id=None, month=None, contrib_id=None) -> dict:
         "collected": sum(x["Paid"] for x in lines),
         "balance": sum(x["Balance"] for x in lines),
         "has_one_off": any(not is_monthly(c) for c in chosen),
+        # Summary tables only make sense across several contributions / members
+        "show_by_contrib": contrib_id is None and len(chosen) > 1,
+        "show_by_member": contrib_id is None and member_id is None and len(chosen) > 1,
     }
 
 
 # ─────────────────────────────────────────────────────────────
-# Excel, Word and CSV writers
+# Excel and Word writers
 # ─────────────────────────────────────────────────────────────
 SHEET_HEADER_ROW = 4        # rows 1-2 hold the Group Name banner, row 3 is blank, row 4 the column headings
 
@@ -1409,14 +1491,14 @@ def create_excel_report(member_id=None, month=None, contrib_id=None, user: str =
         ws = write(writer, idf, "Report", "Summary")
         ws.column_dimensions["B"].width = 44
 
-        if data["by_contrib"]:
+        if data["show_by_contrib"] and data["by_contrib"]:
             cdf = pd.DataFrame(data["by_contrib"])
             cdf.loc[len(cdf)] = ["TOTAL", "", "", int(cdf["Members"].sum()), cdf["Expected"].sum(),
                                  cdf["Collected"].sum(), cdf["Balance"].sum()]
             write(writer, cdf, "By contribution", "By contribution",
                   money_cols=("Expected", "Collected", "Balance"), total_row=True)
 
-        if data["by_member"]:
+        if data["show_by_member"] and data["by_member"]:
             mdf = pd.DataFrame(data["by_member"])
             mdf.loc[len(mdf)] = ["TOTAL", "", "", mdf["Expected"].sum(), mdf["Collected"].sum(), mdf["Balance"].sum()]
             mdf = mdf[["Member", "Contact", "Contributions", "Expected", "Collected", "Balance"]]
@@ -1434,26 +1516,6 @@ def create_excel_report(member_id=None, month=None, contrib_id=None, user: str =
             name = safe_sheet_name(b["name"], used)
             write(writer, bdf, name, f"{b['name']} by month", money_cols=b["columns"][1:], total_row=True)
     return out.getvalue()
-
-
-def create_csv_report(member_id=None, month=None, contrib_id=None, user: str = "") -> bytes:
-    """CSV with the Group Name and report details on the first lines, then the ledger."""
-    data = build_report(member_id, month, contrib_id)
-    buf = io.StringIO()
-    w = csv.writer(buf, lineterminator="\n")
-    w.writerow(["Group", SETTINGS["group_name"]])
-    w.writerow(["Report", data["title"]])
-    for k, v in data["filters"]:
-        w.writerow([k, v])
-    w.writerow(["Currency", SETTINGS["currency"]])
-    w.writerow(["Generated", datetime.now().strftime("%d %B %Y, %H:%M")])
-    w.writerow(["Generated by", user or "-"])
-    w.writerow([])
-    if data["lines"]:
-        pd.DataFrame(data["lines"])[LEDGER_COLS].to_csv(buf, index=False, lineterminator="\n")
-    else:
-        w.writerow(["No records for this selection."])
-    return ("\ufeff" + buf.getvalue()).encode("utf-8")      # BOM so Excel reads UTF-8 correctly
 
 
 def create_word_report(member_id=None, month=None, contrib_id=None, user: str = "") -> bytes:
@@ -1536,21 +1598,22 @@ def create_word_report(member_id=None, month=None, contrib_id=None, user: str = 
     if not data["lines"]:
         doc.add_paragraph("There are no records for this selection.")
     else:
-        # By contribution
-        doc.add_heading("By contribution", level=2)
-        t = new_table(["Contribution", "Type", "Period", "Members", "Expected", "Collected", "Balance"])
-        for o in data["by_contrib"]:
-            c = t.add_row().cells
-            put(c[0], o["Contribution"], bold=True)
-            put(c[1], o["Type"])
-            put(c[2], o["Period"])
-            put(c[3], o["Members"], align=RIGHT)
-            put(c[4], money_text(o["Expected"]) if o["Expected"] else "-", align=RIGHT)
-            put(c[5], money_text(o["Collected"]), align=RIGHT)
-            put(c[6], money_text(o["Balance"]) if o["Expected"] else "-", align=RIGHT)
+        if data["show_by_contrib"]:
+            # By contribution
+            doc.add_heading("By contribution", level=2)
+            t = new_table(["Contribution", "Type", "Period", "Members", "Expected", "Collected", "Balance"])
+            for o in data["by_contrib"]:
+                c = t.add_row().cells
+                put(c[0], o["Contribution"], bold=True)
+                put(c[1], o["Type"])
+                put(c[2], o["Period"])
+                put(c[3], o["Members"], align=RIGHT)
+                put(c[4], money_text(o["Expected"]) if o["Expected"] else "-", align=RIGHT)
+                put(c[5], money_text(o["Collected"]), align=RIGHT)
+                put(c[6], money_text(o["Balance"]) if o["Expected"] else "-", align=RIGHT)
 
         # By member (skipped for a single-member statement)
-        if member_id is None:
+        if data["show_by_member"]:
             doc.add_heading("By member", level=2)
             t = new_table(["Member", "Contributions", "Expected", "Collected", "Balance"])
             for o in data["by_member"]:
@@ -1717,10 +1780,6 @@ def cached_excel(member_id, month, contrib_id, user_id, user, sig) -> bytes:
 def cached_word(member_id, month, contrib_id, user_id, user, sig) -> bytes:
     return create_word_report(member_id, month, contrib_id, user)
 
-
-@st.cache_data(show_spinner=False, max_entries=16)
-def cached_csv(member_id, month, contrib_id, user_id, user, sig) -> bytes:
-    return create_csv_report(member_id, month, contrib_id, user)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2330,7 +2389,7 @@ def report_filename(member, month, contrib, ext: str) -> str:
 
 
 def page_reports():
-    page_header("Reports", "Choose what to include, then download it as Excel, Word or CSV.")
+    page_header("Reports", "Choose what to include, then download it as Excel or Word.")
     members = sorted(load_members(), key=lambda x: x.get("name", "").lower())
     contribs = sorted(load_contribs(), key=mid)
     if not members or not contribs:
@@ -2381,7 +2440,7 @@ def page_reports():
     m_name = m_by.get(who)
     c_name = c_by.get(what)
     with st.container(key="hrow_report"):
-        d1, d2, d3 = st.columns(3)
+        d1, d2 = st.columns(2)
         try:
             d1.download_button("Download Excel", cached_excel(who, when, what, user_id, user, sig),
                                file_name=report_filename(m_name, when, c_name, "xlsx"),
@@ -2400,12 +2459,6 @@ def page_reports():
             d2.warning("Word needs python-docx. Run: pip install python-docx")
         except Exception as e:
             d2.warning(f"Word report failed: {e}")
-        try:
-            d3.download_button("Download CSV", cached_csv(who, when, what, user_id, user, sig),
-                               file_name=report_filename(m_name, when, c_name, "csv"),
-                               mime="text/csv", key="dl_csv", **FULL_DL)
-        except Exception as e:
-            d3.warning(f"CSV report failed: {e}")
 
     with st.expander("Preview"):
         items = []
@@ -2581,6 +2634,10 @@ def page_settings():
         if who:
             st.markdown(f'<div class="p-sub" style="margin-bottom:.5rem">Signed in as <b>{esc(who)}</b></div>',
                         unsafe_allow_html=True)
+        if st.button("Refresh data", key="refresh_data", **FULL_BTN):
+            st.session_state["_db"] = {}
+            flash("Data refreshed.")
+            st.rerun()
         if st.button("Log out", key="logout", **FULL_BTN):
             do_logout()
             st.rerun()
@@ -2618,8 +2675,8 @@ def page_settings():
 # ─────────────────────────────────────────────────────────────
 # App entry
 # ─────────────────────────────────────────────────────────────
-st.session_state["_db"] = {}          # fresh per-run cache: data is re-read from Supabase on every rerun
 require_login()
+prefetch()
 SETTINGS = get_settings()
 
 st.markdown(BASE_CSS, unsafe_allow_html=True)
