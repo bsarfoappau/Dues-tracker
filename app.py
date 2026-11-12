@@ -658,7 +658,7 @@ def run(query):
 # Per-run cache. The script reruns after every click, and many helpers need the same
 # tables, so each table is fetched at most once per run. Writes drop the cache entry.
 # ─────────────────────────────────────────────────────────────
-CACHE_TTL = 60   # seconds. Writes drop the entry at once; this only bounds staleness from other devices.
+CACHE_TTL = 300  # seconds. Only bounds staleness from other devices (Settings > Refresh data reloads at once).
 
 
 def _store() -> dict:
@@ -669,6 +669,27 @@ def touch(*names):
     store = _store()
     for n in names:
         store.pop(n, None)
+
+
+def cache_put_rows(name: str, rows: list):
+    """Add or replace rows (matched by id) in a cached table, so a write needs no re-download."""
+    store = _store()
+    hit = store.get(name)
+    if hit is None:
+        return
+    by_id = {mid(r.get("id")): r for r in hit[1]}
+    for r in rows:
+        by_id[mid(r.get("id"))] = r
+    store[name] = (hit[0], [by_id[k] for k in sorted(by_id)])
+
+
+def cache_drop_rows(name: str, ids: list):
+    store = _store()
+    hit = store.get(name)
+    if hit is None:
+        return
+    gone = {mid(i) for i in ids}
+    store[name] = (hit[0], [r for r in hit[1] if mid(r.get("id")) not in gone])
 
 
 def cached(name: str, loader):
@@ -1248,9 +1269,12 @@ def add_member(name: str, contact: str = "", dues=None, notes: str = ""):
         return False, "Enter a name."
     if find_member(name):
         return False, f"{name} is already in the group."
-    run(sb().table("members").insert({"user_id": uid(), "name": name, "contact": contact.strip(),
-                                      "notes": notes.strip(), "dues": dues}))
-    touch("members")
+    res = run(sb().table("members").insert({"user_id": uid(), "name": name, "contact": contact.strip(),
+                                            "notes": notes.strip(), "dues": dues}))
+    if res is not None and getattr(res, "data", None):
+        cache_put_rows("members", res.data)
+    else:
+        touch("members")
     log_activity("Added member", name)
     return True, f"Added {name}."
 
@@ -1271,8 +1295,11 @@ def add_many(text: str):
         rows.append({"user_id": uid(), "name": name, "contact": parts[1] if len(parts) > 1 else "",
                      "notes": "", "dues": None})
     if rows:
-        run(sb().table("members").insert(rows))
-        touch("members")
+        res = run(sb().table("members").insert(rows))
+        if res is not None and getattr(res, "data", None):
+            cache_put_rows("members", res.data)
+        else:
+            touch("members")
         log_activity("Added members", f"{len(rows)} added")
     return len(rows), skipped
 
@@ -1289,10 +1316,15 @@ def update_member(member_id: int, name: str, contact: str, dues, notes: str):
     if old_rec is None:
         return False, "Member not found."
     old = old_rec.get("name", "")
-    run(sb().table("members").update({"name": name, "contact": contact.strip(), "notes": notes.strip(),
-                                      "dues": dues}).eq("id", member_id))
-    run(sb().table("payments").update({"member_name": name}).eq("member_id", member_id))
-    touch("members", "payments")
+    res = run(sb().table("members").update({"name": name, "contact": contact.strip(), "notes": notes.strip(),
+                                            "dues": dues}).eq("id", member_id))
+    if res is not None and getattr(res, "data", None):
+        cache_put_rows("members", res.data)
+    else:
+        touch("members")
+    if name != old:    # payments keep a copy of the name; skip this extra request when it did not change
+        run(sb().table("payments").update({"member_name": name}).eq("member_id", member_id))
+        touch("payments")
     log_activity("Edited member", f"{old} to {name}" if old != name else name)
     return True, f"Saved {name}."
 
@@ -1339,7 +1371,11 @@ def add_contribution(name: str, frequency: str = "one-off", amount=0.0, notes: s
     return True, f"Added {name}.", new_id
 
 
-def update_contribution(cid: int, name: str, amount, notes: str):
+def update_contribution(cid: int, name: str, amount, notes: str, frequency=None, member_amounts=None,
+                        move_to: str = ""):
+    """frequency: "monthly" / "one-off" / None (keep). member_amounts: True when every member gives a different
+    amount (taken from the Members page), False for one fixed amount, None to keep.
+    move_to: month ("YYYY-MM") that the existing records of a one-off contribution move to when it becomes monthly."""
     name = name.strip()
     if not name:
         return False, "Name cannot be empty."
@@ -1350,8 +1386,21 @@ def update_contribution(cid: int, name: str, amount, notes: str):
     if c is None:
         return False, "Contribution not found."
     fields = {"name": name, "notes": notes.strip()}
-    if not c.get("member_amounts"):
+    diff = bool(c.get("member_amounts")) if member_amounts is None else bool(member_amounts)
+    fields["member_amounts"] = diff
+    if not diff:
         fields["amount"] = float(amount or 0)
+    if frequency in ("monthly", "one-off") and frequency != ("monthly" if is_monthly(c) else "one-off"):
+        has_records = any(mid(p.get("contribution_id")) == cid for p in load_payments())
+        if frequency == "monthly":
+            if has_records:
+                run(sb().table("payments").update({"period": move_to or date.today().strftime("%Y-%m")})
+                    .eq("contribution_id", cid).eq("period", ""))
+                touch("payments")
+        elif has_records:
+            return False, ("This contribution already has payment records, so it cannot become one-off. "
+                           "Delete its records first (History > Delete records).")
+        fields["frequency"] = frequency
     run(sb().table("contributions").update(fields).eq("id", cid))
     touch("contribs")
     old = c.get("name", "")
@@ -1499,8 +1548,11 @@ def set_payment(c: dict, member: dict, period: str, status: str, amount: float, 
     Returns the status that was saved."""
     status = resolve_status(status, float(amount or 0), due_for(c, member))
     rec = _pay_rec(c, member, period, status, amount, notes)
-    run(sb().table("payments").upsert(rec, on_conflict=PAY_CONFLICT))
-    touch("payments")
+    res = run(sb().table("payments").upsert(rec, on_conflict=PAY_CONFLICT))
+    if res is not None and getattr(res, "data", None):
+        cache_put_rows("payments", res.data)
+    else:
+        touch("payments")
     when = f" | {period}" if period else ""
     log_activity("Payment", f"{c.get('name')}{when} | {member.get('name')} | {status} | {rec['amount']:.2f}")
     return status
@@ -1511,17 +1563,24 @@ def set_payments_bulk(c: dict, period: str, pairs: list) -> int:
     if not pairs:
         return 0
     recs = [_pay_rec(c, m, period, "paid", amt) for m, amt in pairs]
-    run(sb().table("payments").upsert(recs, on_conflict=PAY_CONFLICT))
-    touch("payments")
+    res = run(sb().table("payments").upsert(recs, on_conflict=PAY_CONFLICT))
+    if res is not None and getattr(res, "data", None):
+        cache_put_rows("payments", res.data)
+    else:
+        touch("payments")
     when = f" | {period}" if period else ""
     log_activity("Payment", f"{c.get('name')}{when} | marked {len(recs)} member(s) as paid")
     return len(recs)
 
 
 def clear_payment(c: dict, member: dict, period: str):
+    old = pay_map_for(mid(c), period).get(mid(member))
     run(sb().table("payments").delete().eq("contribution_id", mid(c)).eq("member_id", mid(member))
         .eq("period", period))
-    touch("payments")
+    if old and old.get("id") is not None:
+        cache_drop_rows("payments", [old["id"]])
+    else:
+        touch("payments")
     when = f" | {period}" if period else ""
     log_activity("Cleared payment", f"{c.get('name')}{when} | {member.get('name')}")
 
@@ -1530,7 +1589,7 @@ def delete_payments(ids: list):
     ids = [int(i) for i in ids]
     for i in range(0, len(ids), 100):
         run(sb().table("payments").delete().in_("id", ids[i:i + 100]))
-    touch("payments")
+    cache_drop_rows("payments", ids)
     log_activity("Deleted payment records", f"{len(ids)} removed")
 
 
@@ -1598,6 +1657,8 @@ def build_report(member_id=None, month=None, contrib_id=None) -> dict:
     members = sorted(load_members(), key=lambda x: x.get("name", "").lower())
     contribs = sorted(load_contribs(), key=mid)
     pays = load_payments()
+    # month can be None (all months), one "YYYY-MM" text, or several months
+    sel = [month] if isinstance(month, str) and month else (sorted(set(month)) if month and not isinstance(month, str) else [])
     member = next((m for m in members if mid(m) == member_id), None) if member_id is not None else None
     contrib = next((c for c in contribs if mid(c) == contrib_id), None) if contrib_id is not None else None
     chosen = [c for c in contribs if contrib_id is None or mid(c) == contrib_id]
@@ -1610,7 +1671,7 @@ def build_report(member_id=None, month=None, contrib_id=None) -> dict:
         if member_id is not None:
             people = [m for m in people if mid(m) == member_id]
         if monthly:
-            periods = [month] if month else sorted({p.get("period") for p in pays
+            periods = sel if sel else sorted({p.get("period") for p in pays
                                                     if mid(p.get("contribution_id")) == cid and p.get("period")})
         else:
             periods = [""]
@@ -1642,8 +1703,8 @@ def build_report(member_id=None, month=None, contrib_id=None) -> dict:
 
         if not monthly:
             period_text = "One-off"
-        elif month:
-            period_text = month_label(month)
+        elif sel:
+            period_text = month_label(sel[0]) if len(sel) == 1 else f"{len(sel)} months"
         else:
             period_text = f"{len(periods)} month(s)" if periods else "No months yet"
         by_contrib.append({
@@ -1657,7 +1718,7 @@ def build_report(member_id=None, month=None, contrib_id=None) -> dict:
         })
 
         # Month-by-month grid for a monthly contribution when every month is included
-        if monthly and not month and len(periods) > 1 and people:
+        if monthly and len(periods) > 1 and people:
             cols = ["Name"] + [month_short(x) for x in periods] + ["Total"]
             rows = []
             for m in people:
@@ -1697,8 +1758,9 @@ def build_report(member_id=None, month=None, contrib_id=None) -> dict:
     return {
         "title": title,
         "filters": [("Member", member.get("name", "") if member else "All members"),
-                    ("Month", month_label(month) if month else "All months"),
+                    ("Month", ", ".join(month_label(x) for x in sel) if sel else "All months"),
                     ("Contribution", contrib.get("name", "") if contrib else "All contributions")],
+        "months": sel,
         "lines": lines, "by_contrib": by_contrib, "by_member": by_member, "breakdowns": breakdowns,
         "expected": sum(x["Due"] for x in lines),
         "collected": sum(x["Paid"] for x in lines),
@@ -1982,7 +2044,7 @@ def create_word_report(member_id=None, month=None, contrib_id=None, user: str = 
 
         legend = doc.add_paragraph()
         note = "Shading: green = paid, orange = partially paid, red = unpaid, purple = waived. "
-        if data["has_one_off"] and month:
+        if data["has_one_off"] and data["months"]:
             note += "One-off contributions are not tied to a month, so they show everything recorded. "
         lr = legend.add_run(note + f"Amounts are in {cur}.")
         lr.font.size = Pt(8)
@@ -2367,19 +2429,25 @@ def new_contrib_form():
 def edit_contrib_form(c: dict):
     cid = mid(c)
     per = to_float(c.get("amount"))
+    monthly_now = is_monthly(c)
+    this_month = date.today().strftime("%Y-%m")
+    month_opts = [shift_month(this_month, -k) for k in range(24)]
     with st.form(f"cedit_{cid}"):
         n = st.text_input("Name", value=c.get("name", ""), key=f"cen_{cid}")
-        if c.get("member_amounts"):
-            st.caption("Amounts come from each member's dues setting on the Members page, "
-                       "and the default amount in Settings.")
-            a = 0.0
-        else:
-            a = st.number_input(f"Amount per member ({SETTINGS['currency']})", min_value=0.0, step=1.0,
-                                format="%.2f", value=per, key=f"cea_{cid}",
-                                help="Leave at 0 if members give different amounts.")
+        freq = st.selectbox("How often", ["One-off", "Monthly"], index=1 if monthly_now else 0, key=f"cef_{cid}",
+                            help="Monthly contributions are tracked month by month and get the month buttons.")
+        move_to = ""
+        if not monthly_now:
+            move_to = st.selectbox("If you choose Monthly: month for the records already saved", month_opts,
+                                   key=f"cem_{cid}", format_func=month_label)
+        diff = st.checkbox("Members give different amounts", value=bool(c.get("member_amounts")), key=f"ced_{cid}",
+                           help="Tick this to use each member's own dues amount (set on the Members page).")
+        a = st.number_input(f"Amount per member ({SETTINGS['currency']})", min_value=0.0, step=1.0,
+                            format="%.2f", value=per, key=f"cea_{cid}",
+                            help="Everyone is expected to give this amount. Ignored when members give different amounts.")
         nt = st.text_input("Notes", value=c.get("notes", ""), key=f"cenote_{cid}")
         if st.form_submit_button("Save changes", type="primary", **FULL_SUBMIT):
-            ok, msg = update_contribution(cid, n, a, nt)
+            ok, msg = update_contribution(cid, n, a, nt, "monthly" if freq == "Monthly" else "one-off", diff, move_to)
             if ok:
                 st.session_state["_pending_contrib"] = n.strip()
                 flash(msg)
@@ -2513,6 +2581,9 @@ def page_dashboard(month: str):
 
     if c.get("notes"):
         st.caption(c["notes"])
+    if not monthly:
+        st.caption("This is a one-off contribution, so it has no months. To track it month by month, open the menu (☰), "
+                   "choose Edit contribution and set How often to Monthly.")
 
     all_members = load_members()
     if not all_members:
@@ -2545,7 +2616,8 @@ def page_dashboard(month: str):
     if c.get("member_amounts") and SETTINGS["default_dues"] == 0 and not any(m.get("dues") for m in members):
         st.caption("Tip: set a default dues amount in Settings so Mark paid fills in the amount for you.")
     elif not c.get("member_amounts") and per == 0:
-        st.caption("This contribution has no fixed amount. Use Edit on a member's row to record what they gave.")
+        st.caption("This contribution has no fixed amount yet. Set one in the menu (☰) > Edit contribution, "
+                   "or use Set amount on a member's row to record what each member gave.")
 
     # Member list
     with st.container(key="hrow_mhead"):
@@ -2599,7 +2671,7 @@ def page_dashboard(month: str):
                                 st.rerun()
                             k += 1
 
-                        with cols[k].popover("Edit"):
+                        with cols[k].popover("Set amount"):
                             with st.form(f"pf_{cid}_{period}_{i}"):
                                 labels = [STATUS[x][0] for x in STATUS]
                                 start = s if p else "paid"
@@ -2713,6 +2785,9 @@ def page_members():
 # Page: Reports
 # ─────────────────────────────────────────────────────────────
 def report_filename(member, month, contrib, ext: str) -> str:
+    if isinstance(month, (tuple, list)):
+        ms = sorted(month)
+        month = "" if not ms else (ms[0] if len(ms) == 1 else f"{ms[0]}_to_{ms[-1]}")
     parts = [SETTINGS["group_name"], member or "all_members", month or "all_months", contrib or "all_contributions"]
     slug = re.sub(r"[^A-Za-z0-9]+", "_", "_".join(parts)).strip("_").lower()
     return f"report_{slug}.{ext}"
@@ -2729,19 +2804,25 @@ def page_reports():
 
     m_by = {mid(m): m.get("name", "") for m in members}
     c_by = {mid(c): c.get("name", "") for c in contribs}
-    months = export_months(st.session_state.get("month", ""))
+    this_month = date.today().strftime("%Y-%m")
+    # every month with records, plus the last 12 months so any month can be chosen
+    months = sorted(set(export_months(st.session_state.get("month", this_month)))
+                    | {shift_month(this_month, -k) for k in range(12)}, reverse=True)
 
     # forget a stored choice that no longer exists (for example a deleted member)
-    for key, valid in (("rp_member", m_by), ("rp_contrib", c_by), ("rp_month", months)):
+    for key, valid in (("rp_member", m_by), ("rp_contrib", c_by)):
         if st.session_state.get(key) not in [None] + list(valid):
             st.session_state.pop(key, None)
+    if st.session_state.get("rp_months"):
+        st.session_state["rp_months"] = [x for x in st.session_state["rp_months"] if x in months]
 
     with st.container(key="card_report"):
         a, b, c3 = st.columns(3)
         who = a.selectbox("Member", [None] + list(m_by), key="rp_member",
                           format_func=lambda v: "All members" if v is None else m_by[v])
-        when = b.selectbox("Month", [None] + months, key="rp_month",
-                           format_func=lambda v: "All months" if v is None else month_label(v))
+        picked_months = b.multiselect("Months (leave empty for all)", months, key="rp_months",
+                                      format_func=month_label)
+        when = tuple(sorted(picked_months)) or None
         what = c3.selectbox("Contribution", [None] + list(c_by), key="rp_contrib",
                             format_func=lambda v: "All contributions" if v is None else c_by[v])
 
