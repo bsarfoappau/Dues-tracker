@@ -4,8 +4,11 @@ Dues Tracker (Supabase edition)
 * Supabase Auth handles sign up and sign in (the Group Name is captured at sign up).
 * Supabase Postgres stores everything. Row Level Security (RLS) makes sure every
   account can only ever read and write its own rows.
-* The app only ever uses the public "anon" key plus the signed-in user's own token.
-  Never put the service_role key in this app.
+* Normal pages only use the public "anon" key plus the signed-in user's own token.
+* The Admin page is the one exception. It uses the service_role key (read from secrets, on the
+  server only) to manage accounts, and only after the signed-in user's role has been re-checked
+  as "admin" in the database. Never expose that key anywhere else.
+* Passwords can be reset from the sign-in screen (Supabase emails a link back to this app).
 """
 import io
 import re
@@ -22,6 +25,7 @@ from datetime import datetime, date, timezone, timedelta
 import altair as alt
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ─────────────────────────────────────────────────────────────
 # Page config (must be first Streamlit call)
@@ -110,7 +114,7 @@ html { -webkit-text-size-adjust: 100%; }
 header[data-testid="stHeader"] { display: none; }
 section[data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"],
 [data-testid="collapsedControl"] { display: none !important; }
-.block-container { padding: 1.4rem 1.2rem 7rem !important; max-width: 920px !important; }
+.block-container { padding: 1.2rem 1.2rem 2rem !important; max-width: 920px !important; }
 /* the style-only markdown block should not leave a blank gap */
 .stApp [data-testid="stElementContainer"]:has(> [data-testid="stMarkdownContainer"] > style) { display: none; }
 
@@ -224,11 +228,11 @@ div[data-testid="stPopoverBody"] { max-width: min(94vw, 440px) !important; }
 
 /* Rows that must stay side by side on phones (Streamlit would stack them) */
 .stApp [class*="st-key-hrow_"] [data-testid="stHorizontalBlock"],
-.stApp .st-key-bnav [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; gap: .5rem !important; }
+.stApp .st-key-tnav [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; gap: .5rem !important; }
 .stApp [class*="st-key-hrow_"] [data-testid="stColumn"],
 .stApp [class*="st-key-hrow_"] [data-testid="column"],
-.stApp .st-key-bnav [data-testid="stColumn"],
-.stApp .st-key-bnav [data-testid="column"] { flex: 1 1 0 !important; width: auto !important; min-width: 0 !important; }
+.stApp .st-key-tnav [data-testid="stColumn"],
+.stApp .st-key-tnav [data-testid="column"] { flex: 1 1 0 !important; width: auto !important; min-width: 0 !important; }
 .stApp .st-key-hrow_month [data-testid="stColumn"]:nth-child(2),
 .stApp .st-key-hrow_month [data-testid="column"]:nth-child(2) { flex: 3 1 0 !important; }
 .stApp .st-key-hrow_msearch [data-testid="stColumn"]:nth-child(1),
@@ -266,22 +270,21 @@ div[data-testid="stPopoverBody"] { max-width: min(94vw, 440px) !important; }
 .menu-sub { color: #6B6E8F; font-size: .82rem; font-weight: 600; padding: .1rem .3rem .3rem; }
 div[data-testid="stPopoverBody"] { min-width: min(86vw, 260px); }
 
-/* Bottom tab bar */
-.stApp .st-key-bnav {
-    position: fixed !important; left: 0; right: 0; bottom: 0; width: 100% !important; z-index: 1000;
-    background: #fff; border-top: 2px solid #E4E6F4; box-shadow: 0 -8px 24px rgba(35, 27, 107, .10);
-    padding: .4rem .6rem calc(.4rem + env(safe-area-inset-bottom, 0px)) !important;
+/* Top navigation: sits in the normal page flow, so nothing is fixed over the content on phones */
+.stApp .st-key-tnav {
+    background: #fff; border: 2px solid #E4E6F4; border-radius: 18px;
+    padding: .35rem .45rem; margin-bottom: 1rem; box-shadow: 0 4px 14px rgba(35, 27, 107, .06);
 }
-.stApp .st-key-bnav [data-testid="stHorizontalBlock"] { max-width: 560px; margin: 0 auto; }
-.stApp .st-key-bnav button {
+.stApp .st-key-tnav button {
     background: transparent !important; border: 2px solid transparent !important; color: #6B6E8F !important;
-    border-radius: 14px; padding: .2rem .1rem; min-height: 54px;
+    border-radius: 12px; padding: .2rem 0; min-height: 44px;
 }
-.stApp .st-key-bnav button p {
-    white-space: pre-line !important; text-align: center; line-height: 1.2; font-size: .78rem;
+.stApp .st-key-tnav button:hover { background: #F3F4FA !important; color: __COBALT__ !important; }
+.stApp .st-key-tnav button p {
+    white-space: nowrap !important; text-align: center; line-height: 1.2; font-size: .82rem;
     font-weight: 700; color: inherit !important;
 }
-.stApp .st-key-bnav button[data-testid="stBaseButton-primary"] { background: #EEF1FF !important; color: __COBALT__ !important; }
+.stApp .st-key-tnav button[data-testid="stBaseButton-primary"] { background: #EEF1FF !important; color: __COBALT__ !important; }
 
 /* Group banner (top of the dashboard) */
 .group-banner {
@@ -363,7 +366,7 @@ div[data-testid="stPopoverBody"] { min-width: min(86vw, 260px); }
 
 /* Phones */
 @media (max-width: 640px) {
-    .block-container { padding: .8rem .75rem 7rem !important; }
+    .block-container { padding: .8rem .75rem 1.5rem !important; }
     .page-title { font-size: 1.55rem; }
     .page-sub { font-size: .9rem; margin-bottom: .8rem; }
     .big-title { font-size: 1.2rem; }
@@ -378,6 +381,9 @@ div[data-testid="stPopoverBody"] { min-width: min(86vw, 260px); }
     .stApp [class*="st-key-card_"] { padding: .6rem .8rem; border-radius: 16px; }
     .stApp [class*="st-key-card_chart"] { padding: .8rem .8rem .9rem; }
     .empty { padding: 1.4rem; }
+    .stApp .st-key-tnav { padding: .3rem .3rem; border-radius: 14px; margin-bottom: .8rem; }
+    .stApp .st-key-tnav [data-testid="stHorizontalBlock"] { gap: .2rem !important; }
+    .stApp .st-key-tnav button p { font-size: .68rem; }
 }
 </style>
 """
@@ -391,6 +397,11 @@ _LOGIN_CSS = """
 }
 .login-title { font-family: 'Sora', sans-serif; font-weight: 800; font-size: 1.7rem; color: __INDIGO__; text-align: center; }
 .login-sub { color: #5B5E80; text-align: center; font-weight: 500; margin: .3rem 0 1rem; }
+.stApp .st-key-forgot_open button {
+    background: transparent !important; border: 0 !important; color: __COBALT__ !important;
+    text-decoration: underline; min-height: 40px; padding: .2rem .4rem !important; font-weight: 600;
+}
+.stApp .st-key-forgot_open button:hover { background: transparent !important; color: __COBALT_DARK__ !important; }
 @media (max-width: 640px) { .st-key-login_card { margin-top: 3vh; } }
 </style>
 """
@@ -547,7 +558,7 @@ def supabase_config() -> tuple:
     return url.strip(), key.strip()
 
 
-def new_client():
+def new_client(implicit: bool = False):
     url, key = supabase_config()
     if not url or not key:
         st.error("Supabase is not configured. Add url and anon_key under [supabase] in "
@@ -558,7 +569,40 @@ def new_client():
             from supabase import ClientOptions
         except ImportError:
             from supabase.lib.client_options import ClientOptions
-        return create_client(url, key, options=ClientOptions(auto_refresh_token=False))
+        opts = {"auto_refresh_token": False}
+        if implicit:
+            opts["flow_type"] = "implicit"
+        return create_client(url, key, options=ClientOptions(**opts))
+    except Exception:
+        return create_client(url, key)
+
+
+def service_role_key() -> str:
+    """Server-side only. Read from secrets, never shown in the UI or sent to the browser."""
+    key = ""
+    section = get_secret("supabase", None)
+    if section:
+        try:
+            key = str(section.get("service_role_key", ""))
+        except Exception:
+            pass
+    return (key or str(get_secret("SUPABASE_SERVICE_ROLE_KEY", ""))).strip()
+
+
+def new_service_client():
+    """Supabase Admin client (service_role). It bypasses Row Level Security, so it is created only
+    by admin_client(), which first confirms the signed-in user is an admin."""
+    url, _ = supabase_config()
+    key = service_role_key()
+    if not url or not key:
+        raise RuntimeError("The service role key is not configured. Add service_role_key under "
+                           "[supabase] in .streamlit/secrets.toml.")
+    try:
+        try:
+            from supabase import ClientOptions
+        except ImportError:
+            from supabase.lib.client_options import ClientOptions
+        return create_client(url, key, options=ClientOptions(auto_refresh_token=False, persist_session=False))
     except Exception:
         return create_client(url, key)
 
@@ -717,6 +761,42 @@ def get_settings() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
+# Roles (RBAC). The role lives in profiles.role ("user" or "admin"). Users cannot change it:
+# the SQL schema only lets the signed-in role write the other profile columns.
+# ─────────────────────────────────────────────────────────────
+ROLES = ("user", "admin")
+
+
+def current_role() -> str:
+    role = str((load_profile() or {}).get("role") or "user").lower()
+    return role if role in ROLES else "user"
+
+
+def is_admin() -> bool:
+    """Cheap check (cached profile), used only to decide what to show in the navigation."""
+    return current_role() == "admin"
+
+
+def verify_admin_now() -> bool:
+    """Authoritative check, repeated on every admin render and action. It re-reads the role from the
+    database with the user's own token (RLS lets a user read only their own row), so a stale cache
+    can never grant access."""
+    try:
+        prof = _fetch_profile(sb(), uid())
+    except Exception:
+        return False
+    if prof:
+        _store()["profile"] = (time.time(), prof)
+    return bool(prof) and str(prof.get("role") or "").lower() == "admin"
+
+
+def admin_client():
+    if not verify_admin_now():
+        raise PermissionError("Administrator access is required.")
+    return new_service_client()
+
+
+# ─────────────────────────────────────────────────────────────
 # Authentication (Supabase Auth)
 # ─────────────────────────────────────────────────────────────
 def friendly_auth_error(e: Exception) -> str:
@@ -730,6 +810,10 @@ def friendly_auth_error(e: Exception) -> str:
         return "Too many attempts. Please wait a few minutes and try again."
     if "already registered" in low or "already exists" in low:
         return "An account with this email already exists. Try signing in."
+    if "different from the old" in low or "same password" in low:
+        return "Choose a password you have not used before."
+    if "token has expired" in low or "otp_expired" in low or "token is invalid" in low:
+        return "That reset link is invalid or has expired. Request a new one."
     if "password" in low and ("weak" in low or "least" in low or "short" in low):
         return f"Choose a stronger password (at least {MIN_PASSWORD} characters)."
     return msg or "Something went wrong. Please try again."
@@ -772,13 +856,165 @@ def finish_login(client, res):
     st.rerun()
 
 
+RESET_COOLDOWN = 60   # seconds between reset emails from one browser session
+
+
+def _set_forgot(flag: bool):
+    st.session_state["_forgot"] = flag
+
+
+def clear_query_params():
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+
+
+def hash_bridge():
+    """Supabase's default reset email sends the user back as /#access_token=...&type=recovery. A browser
+    never sends the part after # to the server, so this tiny script (it runs in the browser) copies it into
+    the query string, which Streamlit can read. It does nothing on any other page load."""
+    js = """<script>
+    try {
+      var w = window.parent, h = w.location.hash || "";
+      if ((h.indexOf("access_token=") > -1 && h.indexOf("type=recovery") > -1) || h.indexOf("error_code=") > -1) {
+        w.location.replace(w.location.pathname + "?" + h.substring(1));
+      }
+    } catch (e) {}
+    </script>"""
+    if hasattr(st, "iframe"):
+        st.iframe(js, height=1)
+    else:
+        components.html(js, height=0)
+
+
+def consume_recovery_link():
+    """Handles the reset link in either form: ?access_token=...&refresh_token=...&type=recovery (default
+    Supabase email, via hash_bridge) or ?token_hash=...&type=recovery (custom email template). The tokens
+    are used once and removed from the address bar straight away."""
+    qp = st.query_params
+    token_hash = str(qp.get("token_hash", "") or "")
+    access = str(qp.get("access_token", "") or "")
+    refresh = str(qp.get("refresh_token", "") or "")
+    kind = str(qp.get("type", "") or "")
+    err = str(qp.get("error_code", "") or qp.get("error_description", "") or "")
+    if not (token_hash or access or err):
+        return
+    clear_query_params()
+    if st.session_state.get("auth"):
+        return
+    if err:
+        st.session_state["_login_notice"] = "That reset link is invalid or has expired. Request a new one."
+        return
+    if kind != "recovery":
+        return
+    client = new_client()
+    try:
+        if token_hash:
+            res = client.auth.verify_otp({"token_hash": token_hash, "type": "recovery"})
+        else:
+            res = client.auth.set_session(access, refresh)
+        st.session_state["_recovery"] = {"client": client, "email": getattr(res.user, "email", "") or ""}
+    except Exception:
+        st.session_state["_login_notice"] = "That reset link is invalid or has expired. Request a new one."
+
+
+def render_recovery_card():
+    """Shown after the user opens the link in the reset email: choose a new password."""
+    rec = st.session_state["_recovery"]
+    with st.container(key="login_card"):
+        st.markdown('<div class="login-title">New password</div>'
+                    f'<div class="login-sub">Choose a new password for {esc(rec.get("email", ""))}.</div>',
+                    unsafe_allow_html=True)
+        with st.form("recovery_form"):
+            p1 = st.text_input("New password", type="password", placeholder=f"New password (min {MIN_PASSWORD} characters)",
+                               label_visibility="collapsed", key="rec_pw1")
+            p2 = st.text_input("Confirm new password", type="password", placeholder="Confirm new password",
+                               label_visibility="collapsed", key="rec_pw2")
+            go = st.form_submit_button("Update password", type="primary", **FULL_SUBMIT)
+        if go:
+            if len(p1) < MIN_PASSWORD:
+                st.error(f"Use a password of at least {MIN_PASSWORD} characters.")
+            elif p1 != p2:
+                st.error("The two passwords do not match.")
+            else:
+                try:
+                    rec["client"].auth.update_user({"password": p1})
+                except Exception as e:
+                    st.error(friendly_auth_error(e))
+                else:
+                    try:
+                        rec["client"].auth.sign_out()
+                    except Exception:
+                        pass
+                    reset_session("Password updated. Sign in with your new password.")
+                    st.rerun()
+        st.button("Cancel", key="rec_cancel", on_click=lambda: st.session_state.pop("_recovery", None), **FULL_BTN)
+
+
+def forgot_password_form():
+    st.markdown('<div class="menu-head">Reset your password</div>'
+                '<div class="p-sub" style="margin-bottom:.5rem">Enter your email and we will send you a link '
+                'to choose a new password.</div>', unsafe_allow_html=True)
+    with st.form("forgot_form"):
+        email = st.text_input("Email", placeholder="Email", label_visibility="collapsed", key="fp_email")
+        go = st.form_submit_button("Send reset link", type="primary", **FULL_SUBMIT)
+    if go:
+        addr = email.strip()
+        wait = RESET_COOLDOWN - (time.time() - st.session_state.get("_reset_sent_at", 0.0))
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", addr):
+            st.error("Enter a valid email address.")
+        elif wait > 0:
+            st.warning(f"Please wait {int(wait) + 1} seconds before asking for another link.")
+        else:
+            try:
+                new_client(implicit=True).auth.reset_password_for_email(addr)
+            except Exception as e:
+                st.error(friendly_auth_error(e))
+            else:
+                st.session_state["_reset_sent_at"] = time.time()
+                # Same message whether or not the email has an account, so accounts cannot be guessed
+                st.success("If an account exists for that email, a reset link is on its way. "
+                           "Check your inbox and spam folder.")
+    st.button("Back to sign in", key="forgot_back", on_click=_set_forgot, args=(False,), **FULL_BTN)
+
+
+def sign_in_panel():
+    if st.session_state.get("_forgot"):
+        forgot_password_form()
+        return
+    with st.form("login_form"):
+        email = st.text_input("Email", placeholder="Email", label_visibility="collapsed", key="login_email")
+        pw = st.text_input("Password", type="password", placeholder="Password",
+                           label_visibility="collapsed", key="login_pw")
+        go_in = st.form_submit_button("Sign in", type="primary", **FULL_SUBMIT)
+    if go_in:
+        if not email.strip() or not pw:
+            st.error("Enter your email and password.")
+        else:
+            client = new_client()
+            try:
+                res = client.auth.sign_in_with_password({"email": email.strip(), "password": pw})
+            except Exception as e:
+                st.error(friendly_auth_error(e))
+            else:
+                finish_login(client, res)
+    st.button("Forgot password?", key="forgot_open", on_click=_set_forgot, args=(True,))
+
+
 def require_login():
+    consume_recovery_link()
     if st.session_state.get("auth"):
         if refresh_auth():
             return
         reset_session("Your session expired. Please sign in again.")
 
     st.markdown(BASE_CSS + LOGIN_CSS, unsafe_allow_html=True)
+    hash_bridge()
+    if st.session_state.get("_recovery"):
+        render_recovery_card()
+        st.markdown(copyright_html(), unsafe_allow_html=True)
+        st.stop()
     with st.container(key="login_card"):
         st.markdown('<div class="login-title">Dues Tracker</div>'
                     '<div class="login-sub">Sign in, or create an account for your group.</div>',
@@ -790,22 +1026,7 @@ def require_login():
         tab_in, tab_up = st.tabs(["Sign in", "Create account"])
 
         with tab_in:
-            with st.form("login_form"):
-                email = st.text_input("Email", placeholder="Email", label_visibility="collapsed", key="login_email")
-                pw = st.text_input("Password", type="password", placeholder="Password",
-                                   label_visibility="collapsed", key="login_pw")
-                go_in = st.form_submit_button("Sign in", type="primary", **FULL_SUBMIT)
-            if go_in:
-                if not email.strip() or not pw:
-                    st.error("Enter your email and password.")
-                else:
-                    client = new_client()
-                    try:
-                        res = client.auth.sign_in_with_password({"email": email.strip(), "password": pw})
-                    except Exception as e:
-                        st.error(friendly_auth_error(e))
-                    else:
-                        finish_login(client, res)
+            sign_in_panel()
 
         with tab_up:
             with st.form("signup_form"):
@@ -1824,16 +2045,25 @@ def confirm_leave_member(cid: int, member_id: int, member_name: str, contrib_nam
 
 
 # ─────────────────────────────────────────────────────────────
-# Bottom tab bar (replaces the sidebar)
+# Top navigation (replaces the sidebar)
 # ─────────────────────────────────────────────────────────────
 PAGES = [("dashboard", "Home"), ("members", "Members"), ("reports", "Reports"),
          ("history", "History"), ("settings", "Settings")]
 
 
+def nav_pages() -> list:
+    pages = list(PAGES)
+    if is_admin():
+        pages.append(("admin", "Admin"))
+    return pages
+
+
 def render_nav():
-    with st.container(key="bnav"):
-        cols = st.columns(len(PAGES))
-        for col, (key, label) in zip(cols, PAGES):
+    """Rendered at the top of every page, before the page content."""
+    pages = nav_pages()
+    with st.container(key="tnav"):
+        cols = st.columns(len(pages))
+        for col, (key, label) in zip(cols, pages):
             active = st.session_state["page"] == key
             col.button(label, key=f"nav_{key}", type="primary" if active else "secondary",
                        on_click=go_to, args=(key,), **FULL_BTN)
@@ -2249,48 +2479,52 @@ def page_dashboard(month: str):
         st.markdown('<div class="empty"><b>Nothing to show</b><br>No members match this search or filter.</div>',
                     unsafe_allow_html=True)
     else:
-        with st.container(key="mlist"):
-            for m in sorted(shown, key=lambda x: x.get("name", "").lower()):
-                i = mid(m)
-                s = statuses[i]
-                p = pay_map.get(i)
-                due = due_for(c, m)
-                with st.container(key=f"mcard_{cid}_{period}_{i}"):
-                    st.markdown(f'<div class="mrow">{person_html(m)}{chip_html(s)}</div>'
-                                f'{amount_line_html(s, p, due)}', unsafe_allow_html=True)
+        st.caption(f"Showing {len(shown)} of {len(members)} members")
+        # Open by default for small groups; larger groups can collapse it to reach the charts
+        open_list = len(members) <= 10 or bool(q.strip()) or flt != "All"
+        with st.expander("Member list", expanded=open_list):
+            with st.container(key="mlist"):
+                for m in sorted(shown, key=lambda x: x.get("name", "").lower()):
+                    i = mid(m)
+                    s = statuses[i]
+                    p = pay_map.get(i)
+                    due = due_for(c, m)
+                    with st.container(key=f"mcard_{cid}_{period}_{i}"):
+                        st.markdown(f'<div class="mrow">{person_html(m)}{chip_html(s)}</div>'
+                                    f'{amount_line_html(s, p, due)}', unsafe_allow_html=True)
 
-                    can_pay = due > 0 and s not in ("paid", "waived")
-                    cols = st.columns(1 + int(can_pay) + int(bool(p)))
-                    k = 0
-                    if can_pay:
-                        if cols[k].button("Mark paid", key=f"pay_{cid}_{period}_{i}"):
-                            set_payment(c, m, period, "paid", due)
-                            flash(f"{m.get('name')} marked as paid.")
-                            st.rerun()
+                        can_pay = due > 0 and s not in ("paid", "waived")
+                        cols = st.columns(1 + int(can_pay) + int(bool(p)))
+                        k = 0
+                        if can_pay:
+                            if cols[k].button("Mark paid", key=f"pay_{cid}_{period}_{i}"):
+                                set_payment(c, m, period, "paid", due)
+                                flash(f"{m.get('name')} marked as paid.")
+                                st.rerun()
+                            k += 1
+
+                        with cols[k].popover("Edit"):
+                            with st.form(f"pf_{cid}_{period}_{i}"):
+                                labels = [STATUS[x][0] for x in STATUS]
+                                start = s if p else "paid"
+                                sel = st.selectbox("Status", labels, index=list(STATUS).index(start),
+                                                   key=f"ps_{cid}_{period}_{i}")
+                                amt = st.number_input("Amount given", min_value=0.0, step=1.0, format="%.2f",
+                                                      value=to_float(p.get("amount", due)) if p else float(due),
+                                                      key=f"pa_{cid}_{period}_{i}")
+                                note = st.text_input("Note", value=(p.get("notes") or "") if p else "",
+                                                     key=f"pn_{cid}_{period}_{i}")
+                                if st.form_submit_button("Save", type="primary", **FULL_SUBMIT):
+                                    key = [x for x in STATUS if STATUS[x][0] == sel][0]
+                                    set_payment(c, m, period, key, amt, note)
+                                    flash(f"Saved {m.get('name')}.")
+                                    st.rerun()
                         k += 1
 
-                    with cols[k].popover("Edit"):
-                        with st.form(f"pf_{cid}_{period}_{i}"):
-                            labels = [STATUS[x][0] for x in STATUS]
-                            start = s if p else "paid"
-                            sel = st.selectbox("Status", labels, index=list(STATUS).index(start),
-                                               key=f"ps_{cid}_{period}_{i}")
-                            amt = st.number_input("Amount given", min_value=0.0, step=1.0, format="%.2f",
-                                                  value=to_float(p.get("amount", due)) if p else float(due),
-                                                  key=f"pa_{cid}_{period}_{i}")
-                            note = st.text_input("Note", value=(p.get("notes") or "") if p else "",
-                                                 key=f"pn_{cid}_{period}_{i}")
-                            if st.form_submit_button("Save", type="primary", **FULL_SUBMIT):
-                                key = [x for x in STATUS if STATUS[x][0] == sel][0]
-                                set_payment(c, m, period, key, amt, note)
-                                flash(f"Saved {m.get('name')}.")
-                                st.rerun()
-                    k += 1
-
-                    if p and cols[k].button("Undo", key=f"undo_{cid}_{period}_{i}"):
-                        clear_payment(c, m, period)
-                        flash(f"Cleared {m.get('name')}'s record.")
-                        st.rerun()
+                        if p and cols[k].button("Undo", key=f"undo_{cid}_{period}_{i}"):
+                            clear_payment(c, m, period)
+                            flash(f"Cleared {m.get('name')}'s record.")
+                            st.rerun()
 
     # Charts sit below the list so recording payments stays one scroll away
     st.write("")
@@ -2673,6 +2907,199 @@ def page_settings():
 
 
 # ─────────────────────────────────────────────────────────────
+# Page: Admin (administrators only)
+# Uses the Supabase Admin client (service_role). Every function below goes through admin_client(),
+# which re-checks the role in the database first. Deleting an auth user removes their profile,
+# members, contributions, payments and activity through ON DELETE CASCADE in the schema.
+# ─────────────────────────────────────────────────────────────
+ADMIN_PAGE = 200
+
+
+def _paged_rows(client, table: str, columns: str, order: str = "id") -> list:
+    rows, start = [], 0
+    while True:
+        res = client.table(table).select(columns).order(order).range(start, start + PAGE - 1).execute()
+        batch = res.data or []
+        rows += batch
+        if len(batch) < PAGE:
+            return rows
+        start += PAGE
+
+
+def list_accounts() -> list:
+    admin = admin_client()
+    users, page = [], 1
+    while True:
+        res = admin.auth.admin.list_users(page=page, per_page=ADMIN_PAGE)
+        batch = list(res if isinstance(res, list) else (getattr(res, "users", None) or []))
+        users += batch
+        if len(batch) < ADMIN_PAGE:
+            break
+        page += 1
+    profiles = {str(p["id"]): p for p in _paged_rows(admin, "profiles", "id,group_name,role")}
+    rows = []
+    for u in users:
+        p = profiles.get(str(u.id), {})
+        role = str(p.get("role") or "user").lower()
+        rows.append({
+            "id": str(u.id),
+            "email": u.email or "(no email)",
+            "group": p.get("group_name") or "No profile yet",
+            "role": role if role in ROLES else "user",
+            "created": fmt_ts(getattr(u, "created_at", "")),
+            "last_seen": fmt_ts(getattr(u, "last_sign_in_at", "")) or "Never",
+        })
+    rows.sort(key=lambda r: r["email"].lower())
+    return rows
+
+
+def set_account_role(target_id: str, email: str, role: str):
+    if role not in ROLES:
+        return False, "Unknown role."
+    if target_id == uid():
+        return False, "You cannot change your own role."
+    try:
+        admin = admin_client()
+        admin.table("profiles").upsert({"id": target_id, "role": role}, on_conflict="id").execute()
+    except PermissionError:
+        return False, "Administrator access is required."
+    except Exception as e:
+        return False, f"Could not change the role: {e}"
+    touch("admin_accounts")
+    log_activity("Changed account role", f"{email} | {role}")
+    return True, f"{email} is now {'an admin' if role == 'admin' else 'a regular user'}."
+
+
+def delete_account(target_id: str, email: str):
+    if target_id == uid():
+        return False, "You cannot delete your own account here."
+    try:
+        admin = admin_client()
+        res = admin.table("profiles").select("role").eq("id", target_id).limit(1).execute()
+        if res.data and str(res.data[0].get("role") or "").lower() == "admin":
+            return False, "Remove this account's admin access first, then delete it."
+        admin.auth.admin.delete_user(target_id)
+    except PermissionError:
+        return False, "Administrator access is required."
+    except Exception as e:
+        return False, f"Could not delete the account: {e}"
+    touch("admin_accounts")
+    log_activity("Deleted account", email)
+    return True, f"Deleted {email} and all of its data."
+
+
+@_popup("Change role?")
+def confirm_role_change(target_id: str, email: str, new_role: str):
+    verb = "give administrator access to" if new_role == "admin" else "remove administrator access from"
+    st.warning(f"You are about to {verb} **{email}**.")
+    blocked = lockout_message()
+    if blocked:
+        st.error(blocked)
+        return
+    pw = st.text_input("Enter your password to confirm", type="password", key=f"role_pw_{target_id}")
+    c1, c2 = st.columns(2)
+    if c1.button("Confirm", key=f"role_go_{target_id}", **FULL_BTN):
+        ok, msg = verify_protected(pw, "Change account role")
+        if ok:
+            ok, msg = set_account_role(target_id, email, new_role)
+        if ok:
+            flash(msg)
+            st.rerun()
+        else:
+            st.error(msg)
+    if c2.button("Cancel", key=f"dlg_cancel_role_{target_id}", **FULL_BTN):
+        st.rerun()
+
+
+@_popup("Delete account?")
+def confirm_delete_account(target_id: str, email: str, group: str):
+    st.warning(f"This permanently deletes **{email}** (group: {group}) together with all of its members, "
+               "contributions, payments and activity. This cannot be undone.")
+    blocked = lockout_message()
+    if blocked:
+        st.error(blocked)
+        return
+    typed = st.text_input("Type the account's email to confirm", key=f"del_email_{target_id}")
+    pw = st.text_input("Enter your password", type="password", key=f"del_pw_{target_id}")
+    c1, c2 = st.columns(2)
+    if c1.button("Delete account", key=f"del_acct_go_{target_id}", **FULL_BTN):
+        if typed.strip().lower() != email.strip().lower():
+            st.error("The email does not match.")
+        else:
+            ok, msg = verify_protected(pw, "Delete user account")
+            if ok:
+                ok, msg = delete_account(target_id, email)
+            if ok:
+                flash(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+    if c2.button("Cancel", key=f"dlg_cancel_acct_{target_id}", **FULL_BTN):
+        st.rerun()
+
+
+def page_admin():
+    page_header("Admin", "Manage accounts. Only administrators can open this page.")
+    if not verify_admin_now():
+        st.error("You do not have access to this page.")
+        return
+    if not service_role_key():
+        st.warning("The Admin page needs the service role key. Add service_role_key under [supabase] in "
+                   ".streamlit/secrets.toml (or SUPABASE_SERVICE_ROLE_KEY) and restart the app.")
+        return
+    try:
+        accounts = cached("admin_accounts", list_accounts)
+    except Exception as e:
+        st.error(f"Could not load accounts: {e}")
+        return
+
+    admins = sum(1 for a in accounts if a["role"] == "admin")
+    st.markdown(tiles_html([
+        ("Accounts", len(accounts), "registered", COBALT),
+        ("Admins", admins, "full access", VIOLET),
+    ]), unsafe_allow_html=True)
+    st.write("")
+
+    q = st.text_input("Search", placeholder="Search by email or group", label_visibility="collapsed", key="adm_q")
+    needle = q.strip().lower()
+    shown = [a for a in accounts if needle in a["email"].lower() or needle in a["group"].lower()]
+    st.caption(f"Showing {len(shown)} of {len(accounts)} accounts")
+    if not shown:
+        st.markdown('<div class="empty"><b>No match</b><br>Try a different email or group.</div>', unsafe_allow_html=True)
+        return
+
+    with st.expander("Accounts", expanded=len(accounts) <= 10 or bool(needle)):
+        with st.container(key="mlist"):
+            for a in shown:
+                aid = a["id"]
+                is_admin_row = a["role"] == "admin"
+                color = AVATARS[sum(map(ord, aid)) % len(AVATARS)]
+                chip = (f'<span class="chip" style="background:{VIOLET if is_admin_row else COBALT}">'
+                        f'{"Admin" if is_admin_row else "User"}</span>')
+                with st.container(key=f"mcard_adm_{aid}"):
+                    st.markdown(
+                        f'<div class="mrow"><div class="person"><div class="avatar" style="background:{color}">'
+                        f'{esc(initials(a["email"].split("@")[0]))}</div><div>'
+                        f'<div class="p-name">{esc(a["email"])}</div>'
+                        f'<div class="p-sub ell">{esc(a["group"])}</div></div></div>{chip}</div>'
+                        f'<div class="mamt"><span class="p-sub">Joined {esc(a["created"][:10])}</span>'
+                        f'<span class="p-sub">Last sign in {esc(a["last_seen"][:16])}</span></div>',
+                        unsafe_allow_html=True)
+                    if aid == uid():
+                        st.caption("This is your account. It cannot be changed or deleted here.")
+                    elif is_admin_row:
+                        if st.button("Remove admin", key=f"adm_role_{aid}"):
+                            confirm_role_change(aid, a["email"], "user")
+                        st.caption("Remove admin access before deleting this account.")
+                    else:
+                        c1, c2 = st.columns(2)
+                        if c1.button("Make admin", key=f"adm_role_{aid}"):
+                            confirm_role_change(aid, a["email"], "admin")
+                        if c2.button("Delete", key=f"del_acct_{aid}"):
+                            confirm_delete_account(aid, a["email"], a["group"])
+
+
+# ─────────────────────────────────────────────────────────────
 # App entry
 # ─────────────────────────────────────────────────────────────
 require_login()
@@ -2685,6 +3112,12 @@ st.session_state.setdefault("month", date.today().strftime("%Y-%m"))
 
 show_flash()
 
+# Only admins can reach the Admin page; anyone else is sent back to the dashboard
+if st.session_state["page"] == "admin" and not is_admin():
+    st.session_state["page"] = "dashboard"
+
+render_nav()
+
 page = st.session_state["page"]
 if page == "dashboard":
     page_dashboard(st.session_state["month"])
@@ -2694,8 +3127,9 @@ elif page == "reports":
     page_reports()
 elif page == "history":
     page_history()
+elif page == "admin":
+    page_admin()
 else:
     page_settings()
 
 st.markdown(copyright_html(), unsafe_allow_html=True)
-render_nav()
