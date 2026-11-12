@@ -87,13 +87,13 @@ CHART_COLORS = [COBALT, "#00C48C", "#FF5C7A", "#FF9F1C", "#8B5CF6",
 
 STATUS = {
     "paid": ("Paid", MINT),
-    "partial": ("Partial", ORANGE),
+    "partial": ("Partially paid", ORANGE),
     "unpaid": ("Unpaid", CORAL),
     "waived": ("Waived", VIOLET),
 }
 
 # Light fills used in the Excel and Word exports
-STATUS_FILL = {"Paid": "C6EFCE", "Partial": "FFE2C2", "Unpaid": "FFC7CE", "Waived": "E4DBFF", "Not in": "ECECEC"}
+STATUS_FILL = {"Paid": "C6EFCE", "Partially paid": "FFE2C2", "Unpaid": "FFC7CE", "Waived": "E4DBFF", "Not in": "ECECEC"}
 
 
 def status_label(s: str) -> str:
@@ -433,6 +433,12 @@ SETTINGS = dict(DEFAULT_SETTINGS)          # replaced with the signed-in user's 
 MAX_ATTEMPTS = 3
 LOCKOUT_SECONDS = 300
 MIN_PASSWORD = 8
+
+# Sign up: when True (and the service_role key is set in secrets) accounts are created through the Admin API
+# with the email already marked as confirmed. No confirmation email is sent, so Supabase's email rate limit
+# ("too many requests, wait a few minutes") can no longer block sign ups, and sign up is fast.
+# Set to False to go back to normal Supabase sign up with an email confirmation link.
+INSTANT_SIGNUP = True
 
 esc = html.escape
 
@@ -808,7 +814,8 @@ def friendly_auth_error(e: Exception) -> str:
         return "Please confirm your email first. Check your inbox for the confirmation link."
     if "rate limit" in low or "too many" in low:
         return "Too many attempts. Please wait a few minutes and try again."
-    if "already registered" in low or "already exists" in low:
+    if "already registered" in low or "already exists" in low or "already been registered" in low \
+            or "email_exists" in low:
         return "An account with this email already exists. Try signing in."
     if "different from the old" in low or "same password" in low:
         return "Choose a password you have not used before."
@@ -979,6 +986,48 @@ def forgot_password_form():
     st.button("Back to sign in", key="forgot_back", on_click=_set_forgot, args=(False,), **FULL_BTN)
 
 
+@st.cache_resource
+def _login_guard() -> dict:
+    """Shared by every browser session of this running app. Maps email -> failed sign-in count and lock time."""
+    return {"lock": threading.Lock(), "data": {}}
+
+
+def login_locked_message(email: str) -> str:
+    """Text to show while this email is locked out of signing in, or "" when it is not."""
+    guard, key = _login_guard(), email.strip().lower()
+    with guard["lock"]:
+        rec = guard["data"].get(key)
+        if rec and rec.get("until", 0) > time.time():
+            return (f"Wrong password {MAX_ATTEMPTS} times. Sign in is locked for this account for "
+                    f"{_fmt_wait(rec['until'] - time.time())}. Try again after that.")
+    return ""
+
+
+def login_failed(email: str) -> str:
+    """Count a wrong password. Returns the message to show."""
+    guard, key = _login_guard(), email.strip().lower()
+    with guard["lock"]:
+        data = guard["data"]
+        if len(data) > 5000:   # drop stale entries so this can never grow without limit
+            now = time.time()
+            for k in [k for k, v in data.items() if v.get("until", 0) < now and not v.get("fails")]:
+                data.pop(k, None)
+        rec = data.setdefault(key, {"fails": 0, "until": 0})
+        rec["fails"] += 1
+        if rec["fails"] >= MAX_ATTEMPTS:
+            rec["fails"], rec["until"] = 0, time.time() + LOCKOUT_SECONDS
+            return (f"Wrong password {MAX_ATTEMPTS} times. Sign in is locked for this account for "
+                    f"{_fmt_wait(LOCKOUT_SECONDS)}.")
+        left = MAX_ATTEMPTS - rec["fails"]
+    return f"That email or password is not right. {left} attempt(s) left before a timeout."
+
+
+def login_succeeded(email: str):
+    guard = _login_guard()
+    with guard["lock"]:
+        guard["data"].pop(email.strip().lower(), None)
+
+
 def sign_in_panel():
     if st.session_state.get("_forgot"):
         forgot_password_form()
@@ -991,15 +1040,34 @@ def sign_in_panel():
     if go_in:
         if not email.strip() or not pw:
             st.error("Enter your email and password.")
+        elif login_locked_message(email):
+            st.error(login_locked_message(email))
         else:
             client = new_client()
             try:
                 res = client.auth.sign_in_with_password({"email": email.strip(), "password": pw})
             except Exception as e:
-                st.error(friendly_auth_error(e))
+                low = str(e).lower()
+                if "invalid login" in low or "invalid credentials" in low:
+                    st.error(login_failed(email))      # only wrong passwords count towards the timeout
+                else:
+                    st.error(friendly_auth_error(e))
             else:
+                login_succeeded(email)
                 finish_login(client, res)
     st.button("Forgot password?", key="forgot_open", on_click=_set_forgot, args=(True,))
+
+
+def signup_user(client, email: str, password: str, group: str):
+    """Create the account. Returns the Supabase auth response (with a session when the user is signed in)."""
+    if INSTANT_SIGNUP and service_role_key():
+        # The Admin API creates the user as already confirmed and sends no email, so there is no email rate limit.
+        # The trigger on auth.users still creates the profile from user_metadata.group_name.
+        new_service_client().auth.admin.create_user({
+            "email": email, "password": password, "email_confirm": True,
+            "user_metadata": {"group_name": group}})
+        return client.auth.sign_in_with_password({"email": email, "password": password})
+    return client.auth.sign_up({"email": email, "password": password, "options": {"data": {"group_name": group}}})
 
 
 def require_login():
@@ -1051,8 +1119,7 @@ def require_login():
                     client = new_client()
                     try:
                         # group_name travels as user metadata; a database trigger copies it into profiles
-                        res = client.auth.sign_up({"email": email_u.strip(), "password": pw1,
-                                                   "options": {"data": {"group_name": group.strip()}}})
+                        res = signup_user(client, email_u.strip(), pw1, group.strip())
                     except Exception as e:
                         st.error(friendly_auth_error(e))
                     else:
@@ -1385,9 +1452,26 @@ def pay_map_for(cid: int, period: str) -> dict:
             if mid(p.get("contribution_id")) == cid and p.get("period", "") == period}
 
 
-def status_of(m: dict, pay_map: dict) -> str:
+def resolve_status(status: str, amount: float, due: float) -> str:
+    """The status that matches the money actually given.
+    Paid in full (amount >= due) is Paid, something but less than the due is Partially paid, nothing is Unpaid.
+    Waived and Unpaid are kept as chosen. When there is no fixed amount (due is 0) the chosen status is kept."""
+    status = norm_status(status)
+    if status in ("waived", "unpaid") or due <= 0:
+        return status
+    if amount <= 0:
+        return "unpaid"
+    return "paid" if amount >= due - 0.005 else "partial"
+
+
+def status_of(m: dict, pay_map: dict, due=None) -> str:
+    """Status of a member. When due is given, the status follows the amount recorded, so a part payment that
+    was saved as Paid (older records) is still shown as Partially paid."""
     p = pay_map.get(mid(m))
-    return norm_status(p.get("status")) if p else "unpaid"
+    if not p:
+        return "unpaid"
+    s = norm_status(p.get("status"))
+    return s if due is None else resolve_status(s, to_float(p.get("amount")), due)
 
 
 def counted(rec, status: str) -> float:
@@ -1410,12 +1494,16 @@ def _pay_rec(c: dict, member: dict, period: str, status: str, amount: float, not
     }
 
 
-def set_payment(c: dict, member: dict, period: str, status: str, amount: float, notes: str = ""):
+def set_payment(c: dict, member: dict, period: str, status: str, amount: float, notes: str = "") -> str:
+    """Save a payment. The status is worked out from the amount, so a part payment is never saved as Paid.
+    Returns the status that was saved."""
+    status = resolve_status(status, float(amount or 0), due_for(c, member))
     rec = _pay_rec(c, member, period, status, amount, notes)
     run(sb().table("payments").upsert(rec, on_conflict=PAY_CONFLICT))
     touch("payments")
     when = f" | {period}" if period else ""
     log_activity("Payment", f"{c.get('name')}{when} | {member.get('name')} | {status} | {rec['amount']:.2f}")
+    return status
 
 
 def set_payments_bulk(c: dict, period: str, pairs: list) -> int:
@@ -1465,8 +1553,9 @@ def save_settings(name: str, currency: str, dues: float):
 
 def contrib_stats(c: dict, members: list, period: str) -> dict:
     pm = pay_map_for(mid(c), period)
-    sts = {mid(m): status_of(m, pm) for m in members}
+    sts = {mid(m): status_of(m, pm, due_for(c, m)) for m in members}
     paid_n = sum(1 for s in sts.values() if s == "paid")
+    partial_n = sum(1 for s in sts.values() if s == "partial")
     waived_n = sum(1 for s in sts.values() if s == "waived")
     collected = sum(counted(pm.get(mid(m)), sts[mid(m)]) for m in members)
     expected = sum(due_for(c, m) for m in members if sts[mid(m)] != "waived")
@@ -1474,6 +1563,7 @@ def contrib_stats(c: dict, members: list, period: str) -> dict:
         "pay_map": pm,
         "statuses": sts,
         "paid_n": paid_n,
+        "partial_n": partial_n,
         "waived_n": waived_n,
         "unpaid_n": len(members) - paid_n - waived_n,
         "countable": max(len(members) - waived_n, 1),
@@ -1529,9 +1619,9 @@ def build_report(member_id=None, month=None, contrib_id=None) -> dict:
         for per in periods:
             pm = pay_map_for(cid, per)
             for m in people:
-                s = status_of(m, pm)
-                rec = pm.get(mid(m))
                 due = due_for(c, m)
+                s = status_of(m, pm, due)
+                rec = pm.get(mid(m))
                 paid = counted(rec, s)
                 expected = 0.0 if s == "waived" else due
                 balance = 0.0 if s in ("paid", "waived") else max(expected - paid, 0.0)
@@ -1891,7 +1981,7 @@ def create_word_report(member_id=None, month=None, contrib_id=None, user: str = 
                         shade(cells[ci], "E8EBFA")
 
         legend = doc.add_paragraph()
-        note = "Shading: green = paid, orange = partial, red = unpaid, purple = waived. "
+        note = "Shading: green = paid, orange = partially paid, red = unpaid, purple = waived. "
         if data["has_one_off"] and month:
             note += "One-off contributions are not tied to a month, so they show everything recorded. "
         lr = legend.add_run(note + f"Amounts are in {cur}.")
@@ -1949,7 +2039,11 @@ def chip_html(status: str) -> str:
 
 def amount_line_html(status: str, p, due: float) -> str:
     """Caption on the left, amount on the right, one aligned line under the member."""
-    if status in ("paid", "partial"):
+    if status == "partial":
+        given = to_float(p.get("amount", 0)) if p else 0.0
+        left = f"Part payment of {money(due)}. Balance {money(max(due - given, 0))}"
+        right = money(given)
+    elif status == "paid":
         left = f"Given, of {money(due)}" if due else "Given"
         right = money(p.get("amount", 0) if p else 0)
     elif status == "waived":
@@ -2441,7 +2535,8 @@ def page_dashboard(month: str):
     st.markdown(tiles_html([
         ("Members", n, f"{stats['waived_n']} waived" if stats["waived_n"] else "in the group", COBALT),
         ("Paid", stats["paid_n"], f"of {stats['countable']} due", MINT),
-        ("Outstanding", stats["unpaid_n"], "still to give", CORAL),
+        ("Outstanding", stats["unpaid_n"],
+         f"incl. {stats['partial_n']} part paid" if stats["partial_n"] else "still to give", CORAL),
         ("Collected", money(stats["collected"]),
          f"of {money(expected)} expected" if expected else "no fixed amount", SUN, "#17153B"),
     ]), unsafe_allow_html=True)
@@ -2467,12 +2562,13 @@ def page_dashboard(month: str):
                     st.rerun()
 
     q = st.text_input("Search", placeholder="Search members", label_visibility="collapsed", key=f"dq_{cid}")
-    flt = pick_one("Show", ["All", "Unpaid", "Paid"], key=f"df_{cid}", default="All") or "All"
+    flt = pick_one("Show", ["All", "Unpaid", "Partially paid", "Paid"], key=f"df_{cid}", default="All") or "All"
 
     shown = [m for m in members
              if q.strip().lower() in m.get("name", "").lower()
              and (flt == "All"
                   or (flt == "Paid" and statuses[mid(m)] == "paid")
+                  or (flt == "Partially paid" and statuses[mid(m)] == "partial")
                   or (flt == "Unpaid" and statuses[mid(m)] in ("unpaid", "partial")))]
 
     if not shown:
@@ -2509,15 +2605,15 @@ def page_dashboard(month: str):
                                 start = s if p else "paid"
                                 sel = st.selectbox("Status", labels, index=list(STATUS).index(start),
                                                    key=f"ps_{cid}_{period}_{i}")
-                                amt = st.number_input("Amount given", min_value=0.0, step=1.0, format="%.2f",
+                                amt = st.number_input("Total amount given so far", min_value=0.0, step=1.0, format="%.2f",
                                                       value=to_float(p.get("amount", due)) if p else float(due),
                                                       key=f"pa_{cid}_{period}_{i}")
                                 note = st.text_input("Note", value=(p.get("notes") or "") if p else "",
                                                      key=f"pn_{cid}_{period}_{i}")
                                 if st.form_submit_button("Save", type="primary", **FULL_SUBMIT):
                                     key = [x for x in STATUS if STATUS[x][0] == sel][0]
-                                    set_payment(c, m, period, key, amt, note)
-                                    flash(f"Saved {m.get('name')}.")
+                                    saved = set_payment(c, m, period, key, amt, note)
+                                    flash(f"Saved {m.get('name')} as {STATUS[saved][0]}.")
                                     st.rerun()
                         k += 1
 
@@ -2754,6 +2850,16 @@ def page_history():
                             f'{esc(money(total))} in total</div>', unsafe_allow_html=True)
 
                 limit = st.session_state.get("hist_limit", HIST_STEP)
+                c_by_id = {mid(c): c for c in load_contribs()}
+                m_by_id = {mid(m): m for m in load_members()}
+
+                def shown_status(p):
+                    c, m = c_by_id.get(mid(p.get("contribution_id"))), m_by_id.get(mid(p.get("member_id")))
+                    if c is None:
+                        return norm_status(p.get("status"))
+                    due = due_for(c, m) if m is not None else (0.0 if c.get("member_amounts") else to_float(c.get("amount")))
+                    return resolve_status(p.get("status"), to_float(p.get("amount")), due)
+
                 items = []
                 for p in rows[:limit]:
                     cname = cnames.get(mid(p.get("contribution_id")), "")
@@ -2764,7 +2870,7 @@ def page_history():
                         f'<div class="rec"><div class="rec-top"><span class="p-name">{esc(p.get("member_name", ""))}</span>'
                         f'<span class="amt">{esc(money(to_float(p.get("amount"))))}</span></div>'
                         f'<div class="p-sub">{esc(cname)} · {esc(per)}</div>'
-                        f'<div class="rec-bot">{chip_html(norm_status(p.get("status")))}{note}</div></div>')
+                        f'<div class="rec-bot">{chip_html(shown_status(p))}{note}</div></div>')
                 st.markdown('<div class="reclist">' + "".join(items) + "</div>", unsafe_allow_html=True)
                 if len(rows) > limit:
                     st.write("")
